@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """
 Generate search queries for each condition (outcome) in candidate markets using GPT-5 mini.
-Reads from candidate_markets_filtered.json and outputs to data/market_queries.json
 
-Each event can have multiple conditions (e.g., "Will Ken Paxton win?" and "Will John Cornyn win?").
-We generate queries for each condition separately since each has its own price/probability.
+Functions for pipeline:
+    generate_queries(conditions: list[FilteredCondition]) -> list[ConditionQueries]
+
+CLI Usage:
+    python generate_queries.py              # Generate queries for filtered conditions
+    python generate_queries.py --limit 10   # Limit to 10 conditions
 """
 
 import json
@@ -15,44 +18,44 @@ import random
 import argparse
 from pathlib import Path
 from datetime import datetime, timezone
-from dataclasses import dataclass, asdict
 from typing import Optional, Literal
-from enum import Enum
 
 from openai import OpenAI
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
+# Add parent to path for imports
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from models.market import FilteredCondition
+from models.query import SearchQuery as SearchQueryModel, ConditionQueries
+from src.cost_tracker import UsageStats
+from config.settings import settings
+
 # Load environment variables
 env_path = Path(__file__).parent.parent / ".env"
 load_dotenv(env_path)
 
-# Configuration
-MODEL = "gpt-5-mini"  # GPT-5 mini
-RATE_LIMIT_DELAY = 0.5  # seconds between API calls
+# Configuration (from settings.py)
+MODEL = settings.query_model
+RATE_LIMIT_DELAY = settings.query_rate_limit_delay
 
 
 # =============================================================================
-# STRUCTURED OUTPUT SCHEMAS (Pydantic)
+# STRUCTURED OUTPUT SCHEMAS (for OpenAI API)
 # =============================================================================
 
-class Priority(str, Enum):
-    HIGH = "high"
-    MEDIUM = "medium"
-    LOW = "low"
-
-
-class SearchQuery(BaseModel):
-    """A single search query for researching a market condition."""
-    query: str  # The actual search query string
-    purpose: str  # What evidence this query seeks
+class SearchQuerySchema(BaseModel):
+    """Schema for OpenAI structured output."""
+    query: str
+    purpose: str
     category: Literal["base_rate", "procedural", "sentiment", "recent_developments", "structural_factors", "other"]
-    priority: Literal["high", "medium", "low"]  # Relevance priority
+    priority: Literal["high", "medium", "low"]
 
 
-class QueryResponse(BaseModel):
-    """Response containing all search queries for a condition."""
-    queries: list[SearchQuery]
+class QueryResponseSchema(BaseModel):
+    """Schema for OpenAI structured output."""
+    queries: list[SearchQuerySchema]
 
 
 # =============================================================================
@@ -84,50 +87,29 @@ Choose the 5 most important questions for determining the probability of THIS SP
 
 
 # =============================================================================
-# OUTPUT DATACLASS
+# INTERNAL FUNCTIONS
 # =============================================================================
 
-@dataclass
-class ConditionQueries:
-    """Queries for a single condition (outcome) within an event."""
-    condition_id: str
-    event_id: str
-    event_title: str
-    outcome_question: str
-    yes_price: float
-    end_date: Optional[str]
-    condition_volume: Optional[float]
-    condition_liquidity: Optional[float]
-    market_meta: dict
-    queries: list[dict]
-    generated_at: str
-    model: str
-
-
-def generate_queries_for_condition(client: OpenAI, event: dict, outcome: dict) -> Optional[list[dict]]:
-    """Generate search queries for a single condition using GPT-5 mini with structured output."""
+def _generate_queries_for_condition(
+    client: OpenAI, 
+    condition: FilteredCondition,
+) -> tuple[Optional[list[SearchQueryModel]], dict]:
+    """
+    Generate search queries for a single condition using GPT-5 mini with structured output.
     
-    # Build context about other outcomes in the same event
-    other_outcomes = [o for o in event.get('outcomes', []) if o['condition_id'] != outcome['condition_id']]
-    other_outcomes_text = ""
-    if other_outcomes:
-        other_outcomes_text = "\n\nOther outcomes in this event:\n" + "\n".join([
-            f"  - {o['question']} (current: {o['yes_price']:.1%})"
-            for o in other_outcomes
-        ])
+    Returns:
+        Tuple of (queries list or None, usage dict with input_tokens, output_tokens, cost_usd)
+    """
+    usage_info = {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0}
     
-    user_prompt = f"""Event: {event['title']}
+    user_prompt = f"""Event: {condition.event_title}
 
-CONDITION TO ANALYZE: {outcome['question']}
-Current market price: {outcome['yes_price']:.1%}
+CONDITION TO ANALYZE: {condition.outcome_question}
+Current market price: {condition.yes_price:.1%}
 
-Event Description: {event.get('description', 'No description')[:500]}
-{other_outcomes_text}
+Resolution date: {condition.end_date or 'Unknown'}
 
-Resolution date: {event.get('end_date', 'Unknown')}
-Days until resolution: {event.get('hours_until_end', 0) / 24:.1f}
-
-Generate research questions to help evaluate the probability of: {outcome['question']}"""
+Generate research questions to help evaluate the probability of: {condition.outcome_question}"""
 
     try:
         # Use structured output with Pydantic schema
@@ -137,40 +119,135 @@ Generate research questions to help evaluate the probability of: {outcome['quest
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt}
             ],
-            response_format=QueryResponse,
+            response_format=QueryResponseSchema,
             max_completion_tokens=4000
         )
+        
+        # Extract usage/cost
+        if hasattr(response, 'usage') and response.usage:
+            input_tok = response.usage.prompt_tokens or 0
+            output_tok = response.usage.completion_tokens or 0
+            # GPT-5-mini pricing: $0.15/1M input, $0.60/1M output
+            cost = (input_tok * 0.15 + output_tok * 0.60) / 1_000_000
+            usage_info = {
+                "input_tokens": input_tok,
+                "output_tokens": output_tok,
+                "cost_usd": cost,
+            }
         
         # Get parsed response
         parsed = response.choices[0].message.parsed
         
         if parsed is None:
-            # Check for refusal
             if response.choices[0].message.refusal:
                 print(f"  ⚠️  Model refused: {response.choices[0].message.refusal}")
             else:
                 print(f"  ⚠️  Empty parsed response")
-            return None
+            return None, usage_info
         
-        # Convert Pydantic models to dicts and add query IDs
-        # Use condition_id (shortened) for query_id prefix
-        condition_short = outcome['condition_id'][-16:]  # Last 16 chars of condition hash
-        queries_with_ids = []
+        # Convert to shared model with query IDs
+        condition_short = condition.condition_id[-16:]
+        queries = []
         for idx, q in enumerate(parsed.queries):
-            query_dict = q.model_dump()
-            query_dict['query_id'] = f"{condition_short}_q{idx}"
-            queries_with_ids.append(query_dict)
-        return queries_with_ids
+            queries.append(SearchQueryModel(
+                query_id=f"{condition_short}_q{idx}",
+                query=q.query,
+                purpose=q.purpose,
+                category=q.category,
+                priority=q.priority,
+            ))
+        return queries, usage_info
             
     except Exception as e:
         print(f"  ❌ API error: {e}")
-        return None
+        return None, usage_info
+
+
+# =============================================================================
+# PUBLIC API (for pipeline use)
+# =============================================================================
+
+def generate_queries(
+    conditions: list[FilteredCondition],
+    client: OpenAI = None,
+    verbose: bool = True,
+) -> tuple[list[ConditionQueries], UsageStats]:
+    """
+    Generate search queries for a list of conditions.
+    
+    This is the main entry point for the pipeline.
+    
+    Args:
+        conditions: List of FilteredCondition to generate queries for
+        client: Optional OpenAI client (created if not provided)
+        verbose: Print progress
+        
+    Returns:
+        Tuple of (List of ConditionQueries, UsageStats with cost info)
+    """
+    if client is None:
+        api_key = os.getenv("OPENAI_KEY")
+        if not api_key:
+            raise ValueError("OPENAI_KEY not found in environment")
+        client = OpenAI(api_key=api_key)
+    
+    results = []
+    stats = UsageStats()
+    
+    for i, condition in enumerate(conditions):
+        if verbose:
+            q_short = condition.outcome_question[:45] + "..." if len(condition.outcome_question) > 45 else condition.outcome_question
+            print(f"[{i+1}/{len(conditions)}] {q_short} ({condition.yes_price:.1%})")
+        
+        queries, usage_info = _generate_queries_for_condition(client, condition)
+        
+        # Track in aggregate stats
+        stats.input_tokens += usage_info["input_tokens"]
+        stats.output_tokens += usage_info["output_tokens"]
+        stats.total_tokens += usage_info["input_tokens"] + usage_info["output_tokens"]
+        stats.estimated_cost += usage_info["cost_usd"]
+        stats.requests += 1
+        
+        if queries:
+            result = ConditionQueries(
+                condition_id=condition.condition_id,
+                event_id=condition.event_id,
+                event_title=condition.event_title,
+                outcome_question=condition.outcome_question,
+                yes_price=condition.yes_price,
+                volume=condition.volume,
+                liquidity=condition.liquidity,
+                end_date=condition.end_date,
+                queries=queries,
+                generated_at=datetime.now(timezone.utc).isoformat(),
+                model=MODEL,
+                # Store cost per condition
+                input_tokens=usage_info["input_tokens"],
+                output_tokens=usage_info["output_tokens"],
+                cost_usd=usage_info["cost_usd"],
+            )
+            results.append(result)
+            if verbose:
+                print(f"  ✅ Generated {len(queries)} queries [${usage_info['cost_usd']:.4f}]")
+        else:
+            if verbose:
+                print(f"  ❌ Failed to generate queries")
+        
+        # Rate limiting
+        if i < len(conditions) - 1:
+            time.sleep(RATE_LIMIT_DELAY)
+    
+    if verbose:
+        print(f"\n   💰 Total: {stats.summary()}")
+    
+    return results, stats
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate search queries for market conditions using GPT-5 mini")
+    """CLI entry point."""
+    parser = argparse.ArgumentParser(description="Generate search queries for market conditions")
     parser.add_argument("--input", type=str, default="data/candidate_markets_filtered.json",
-                        help="Input file with candidate markets")
+                        help="Input file with filtered conditions")
     parser.add_argument("--output", type=str, default="data/market_queries.json",
                         help="Output file for generated queries")
     parser.add_argument("--limit", type=int, default=None,
@@ -178,13 +255,13 @@ def main():
     parser.add_argument("--dry-run", action="store_true",
                         help="Print what would be processed without calling API")
     parser.add_argument("--regenerate", action="store_true",
-                        help="Regenerate queries for all conditions, replacing existing ones")
-    parser.add_argument("--replace-output", action="store_true",
-                        help="Write only newly generated queries (overwrite output file)")
+                        help="Regenerate queries for all conditions")
     parser.add_argument("--random", action="store_true",
-                        help="Randomly select conditions (use with --limit for random sample)")
+                        help="Randomly select conditions (use with --limit)")
     parser.add_argument("--seed", type=int, default=None,
-                        help="Random seed for reproducibility (use with --random)")
+                        help="Random seed for reproducibility")
+    parser.add_argument("--no-save", action="store_true",
+                        help="Don't save to JSON files")
     args = parser.parse_args()
     
     script_dir = Path(__file__).parent
@@ -192,41 +269,27 @@ def main():
     input_path = project_dir / args.input
     output_path = project_dir / args.output
     
-    # Load markets
-    print(f"📂 Loading markets from {input_path}")
+    # Load conditions from JSON
+    print(f"📂 Loading conditions from {input_path}")
     with open(input_path) as f:
-        markets = json.load(f)
+        raw_conditions = json.load(f)
     
-    # Flatten to list of (event, outcome) pairs
-    all_conditions = []
-    for market in markets:
-        for outcome in market.get('outcomes', []):
-            all_conditions.append((market, outcome))
+    # Convert to FilteredCondition models
+    conditions = [FilteredCondition(**c) for c in raw_conditions]
+    print(f"📊 Found {len(conditions)} conditions")
     
-    total_conditions = len(all_conditions)
-    print(f"📊 Found {total_conditions} conditions across {len(markets)} events")
-    
-    # Load existing queries to skip already-processed conditions
-    existing_queries = []
+    # Load existing queries to skip already-processed
     existing_condition_ids = set()
-    if args.replace_output:
-        print("🧹 Replace-output mode: will overwrite file with newly generated queries")
-    elif output_path.exists() and not args.regenerate:
-        print(f"📂 Loading existing queries from {output_path}")
+    existing_queries = []
+    if output_path.exists() and not args.regenerate:
         with open(output_path) as f:
             existing_queries = json.load(f)
         existing_condition_ids = {q['condition_id'] for q in existing_queries}
-        print(f"   Found {len(existing_condition_ids)} existing condition queries")
-    elif args.regenerate:
-        print("🔄 Regenerate mode: will replace all existing queries")
+        print(f"   Found {len(existing_condition_ids)} existing queries")
     
-    # Filter out conditions that already have queries
-    conditions_to_process = [
-        (e, o) for e, o in all_conditions 
-        if o['condition_id'] not in existing_condition_ids
-    ]
-    
-    skipped = total_conditions - len(conditions_to_process)
+    # Filter out already-processed conditions
+    conditions_to_process = [c for c in conditions if c.condition_id not in existing_condition_ids]
+    skipped = len(conditions) - len(conditions_to_process)
     
     # Apply limit (with optional random sampling)
     if args.limit and args.limit < len(conditions_to_process):
@@ -234,120 +297,58 @@ def main():
             if args.seed is not None:
                 random.seed(args.seed)
                 print(f"🎲 Random sampling with seed {args.seed}")
-            else:
-                print(f"🎲 Random sampling (no seed)")
             conditions_to_process = random.sample(conditions_to_process, args.limit)
         else:
             conditions_to_process = conditions_to_process[:args.limit]
     
-    print(f"📊 Processing {len(conditions_to_process)} conditions ({skipped} skipped, {total_conditions} total)")
+    print(f"📊 Processing {len(conditions_to_process)} conditions ({skipped} skipped)")
     
     if args.dry_run:
         print("\n🔍 DRY RUN - Conditions that would be processed:")
-        for i, (event, outcome) in enumerate(conditions_to_process):
-            q_short = outcome['question'][:55] + "..." if len(outcome['question']) > 55 else outcome['question']
-            print(f"  {i+1}. {q_short} ({outcome['yes_price']:.1%})")
-        if skipped > 0:
-            print(f"\n⏭️  Skipped {skipped} conditions with existing queries")
-        return
+        for i, c in enumerate(conditions_to_process):
+            q_short = c.outcome_question[:55] + "..." if len(c.outcome_question) > 55 else c.outcome_question
+            print(f"  {i+1}. {q_short} ({c.yes_price:.1%})")
+        return None
     
-    # Check if there's anything to process
     if not conditions_to_process:
-        print("\n✅ All conditions already have queries. Nothing to do.")
-        print(f"   Use --regenerate to force regeneration of all queries.")
-        return
+        print("\n✅ All conditions already have queries. Use --regenerate to force.")
+        return []
     
-    # Check for API key (only needed for actual runs)
-    api_key = os.getenv("OPENAI_KEY")
-    if not api_key:
-        print(f"❌ OPENAI_KEY not found in environment")
-        print(f"   Expected .env at: {env_path}")
-        print(f"   .env exists: {env_path.exists()}")
-        sys.exit(1)
+    # Generate queries using the public API function
+    print(f"\n🚀 Generating queries using {MODEL}...\n")
+    new_results, stats = generate_queries(conditions_to_process, verbose=True)
     
-    print(f"🔑 API key loaded ({len(api_key)} chars)")
+    if args.no_save:
+        print(f"\n✅ Generated {len(new_results)} condition queries (not saved)")
+        return new_results, stats
     
-    # Initialize OpenAI client
-    client = OpenAI(api_key=api_key)
+    # Convert to dicts for JSON serialization
+    new_results_dicts = []
+    for r in new_results:
+        d = r.model_dump()
+        # Convert SearchQuery models to dicts
+        d['queries'] = [q.model_dump() for q in r.queries]
+        new_results_dicts.append(d)
     
-    # Process each condition
-    new_results = []
-    errors = []
-    
-    print(f"\n🚀 Generating queries using {MODEL} (structured output)...\n")
-    
-    for i, (event, outcome) in enumerate(conditions_to_process):
-        q_short = outcome['question'][:45] + "..." if len(outcome['question']) > 45 else outcome['question']
-        print(f"[{i+1}/{len(conditions_to_process)}] {q_short} ({outcome['yes_price']:.1%})")
-        
-        queries = generate_queries_for_condition(client, event, outcome)
-        
-        if queries:
-            result = ConditionQueries(
-                condition_id=outcome['condition_id'],
-                event_id=event['event_id'],
-                event_title=event['title'],
-                outcome_question=outcome['question'],
-                yes_price=outcome['yes_price'],
-                end_date=event.get("end_date"),
-                condition_volume=outcome.get("volume"),
-                condition_liquidity=outcome.get("liquidity"),
-                market_meta={
-                    "slug": event.get("slug"),
-                    "description": event.get("description"),
-                    "hours_until_end": event.get("hours_until_end"),
-                    "event_liquidity": event.get("liquidity"),
-                    "event_volume": event.get("volume"),
-                    "condition_liquidity": outcome.get("liquidity"),
-                    "tags": event.get("tags"),
-                    "tag_ids": event.get("tag_ids"),
-                    "resolution_source": event.get("resolution_source"),
-                    "outcome_count": event.get("outcome_count"),
-                    "complexity_score": event.get("complexity_score"),
-                    "edge_potential": event.get("edge_potential"),
-                    "updated_at": event.get("updated_at"),
-                },
-                queries=queries,
-                generated_at=datetime.now(timezone.utc).isoformat(),
-                model=MODEL
-            )
-            new_results.append(asdict(result))
-            print(f"  ✅ Generated {len(queries)} queries")
-        else:
-            errors.append(outcome['condition_id'])
-            print(f"  ❌ Failed to generate queries")
-        
-        # Rate limiting
-        if i < len(conditions_to_process) - 1:
-            time.sleep(RATE_LIMIT_DELAY)
-    
-    # Merge with existing queries (new results take precedence)
-    if existing_queries and not args.regenerate and not args.replace_output:
-        # Build a dict of existing queries by condition_id
+    # Merge with existing
+    if existing_queries and not args.regenerate:
         existing_by_id = {q['condition_id']: q for q in existing_queries}
-        # Update with new results
-        for r in new_results:
+        for r in new_results_dicts:
             existing_by_id[r['condition_id']] = r
         final_results = list(existing_by_id.values())
     else:
-        final_results = new_results
+        final_results = new_results_dicts
     
-    # Save results
+    # Save
     output_path.parent.mkdir(exist_ok=True)
     with open(output_path, "w") as f:
         json.dump(final_results, f, indent=2)
     
     print(f"\n{'='*60}")
     print(f"✅ Generated {len(new_results)} new condition queries")
-    print(f"✅ Total {len(final_results)} condition queries saved to {output_path}")
-    if errors:
-        print(f"❌ Failed: {len(errors)} conditions")
+    print(f"✅ Total {len(final_results)} saved to {output_path}")
     
-    # Summary stats
-    new_query_count = sum(len(r['queries']) for r in new_results)
-    print(f"📊 New queries generated: {new_query_count}")
-    if new_results:
-        print(f"📊 Average queries per condition: {new_query_count / len(new_results):.1f}")
+    return new_results
 
 
 if __name__ == "__main__":

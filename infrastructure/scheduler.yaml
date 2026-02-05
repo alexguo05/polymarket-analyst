@@ -1,0 +1,68 @@
+# Cloud Scheduler jobs for Polymarket Analyst
+# Apply with: gcloud scheduler jobs create http ...
+
+# ============================================================================
+# JOB 1: Daily Full Pipeline Run
+# ============================================================================
+# Runs at 00:00 UTC daily
+# 
+# gcloud scheduler jobs create http polymarket-daily-pipeline \
+#   --schedule="0 0 * * *" \
+#   --uri="https://polymarket-analyst-HASH-uc.a.run.app/api/pipeline/run" \
+#   --http-method=POST \
+#   --headers="Content-Type=application/json" \
+#   --message-body='{"mode": "full", "limit": 50}' \
+#   --time-zone="UTC" \
+#   --location="us-central1" \
+#   --attempt-deadline="3600s" \
+#   --description="Daily full pipeline run"
+
+# ============================================================================
+# JOB 2: Hourly Position Price Update
+# ============================================================================
+# Updates current prices for open positions every hour
+#
+# gcloud scheduler jobs create http polymarket-hourly-prices \
+#   --schedule="0 * * * *" \
+#   --uri="https://polymarket-analyst-HASH-uc.a.run.app/api/positions/update-prices" \
+#   --http-method=POST \
+#   --time-zone="UTC" \
+#   --location="us-central1" \
+#   --attempt-deadline="300s" \
+#   --description="Hourly position price update"
+
+# ============================================================================
+# JOB 3: Position Re-analysis (Weekly)
+# ============================================================================
+# Re-runs analysis for open positions on Sundays
+#
+# gcloud scheduler jobs create http polymarket-weekly-reanalysis \
+#   --schedule="0 12 * * 0" \
+#   --uri="https://polymarket-analyst-HASH-uc.a.run.app/api/pipeline/run" \
+#   --http-method=POST \
+#   --headers="Content-Type=application/json" \
+#   --message-body='{"mode": "positions_only"}' \
+#   --time-zone="UTC" \
+#   --location="us-central1" \
+#   --attempt-deadline="3600s" \
+#   --description="Weekly position re-analysis"
+
+# ============================================================================
+# DEPLOYMENT INSTRUCTIONS
+# ============================================================================
+#
+# 1. First, deploy the Cloud Run service using cloudbuild.yaml
+# 
+# 2. Get the service URL:
+#    gcloud run services describe polymarket-analyst --region=us-central1 --format='value(status.url)'
+#
+# 3. Replace HASH in the URIs above with your actual service hash
+#
+# 4. Create each scheduler job using the gcloud commands above
+#
+# 5. To test a job immediately:
+#    gcloud scheduler jobs run polymarket-daily-pipeline --location=us-central1
+#
+# 6. To view job history:
+#    gcloud scheduler jobs list --location=us-central1
+

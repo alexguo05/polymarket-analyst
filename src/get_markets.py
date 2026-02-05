@@ -8,17 +8,31 @@ fundamental analysis can provide an edge.
 Usage:
     python get_markets.py              # Fetch and filter markets
     python get_markets.py --verbose    # Show detailed filter decisions
+
+Functions for pipeline:
+    scan_markets() -> list[CandidateMarket]
+    get_filtered_conditions() -> list[FilteredCondition]
 """
 
 import argparse
 import json
 import re
 import requests
+import sys
 import time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+
+# Add parent to path for imports
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from models.market import (
+    Outcome as OutcomeModel,
+    CandidateMarket as CandidateMarketModel,
+    FilteredCondition,
+)
 
 
 # =============================================================================
@@ -417,9 +431,9 @@ def filter_events(events: list[dict], verbose: bool = False) -> list[CandidateMa
         complexity = calculate_complexity_score(event)
         
         outcomes_simplified = [{
-            "question": o.get("question", "")[:100],
-            "yes_price": o.get("yes_price"),
-            "condition_id": o.get("condition_id"),
+                "question": o.get("question", "")[:100],
+                "yes_price": o.get("yes_price"),
+                "condition_id": o.get("condition_id"),
             "volume": o.get("volume"),
             "liquidity": o.get("liquidity"),
         } for o in outcomes]
@@ -537,58 +551,201 @@ def create_filtered_output(candidates: list[CandidateMarket]) -> list[dict]:
 
 
 # =============================================================================
-# MAIN
+# PUBLIC API (for pipeline use)
+# =============================================================================
+
+def scan_markets(verbose: bool = False) -> list[CandidateMarketModel]:
+    """
+    Fetch and filter markets from Polymarket.
+    
+    Returns list of CandidateMarket models (typed Pydantic models).
+    This is the main entry point for the pipeline.
+    """
+    # Fetch all events from API
+    events = fetch_all_events()
+    
+    # Filter events
+    candidates = filter_events(events, verbose=verbose)
+    
+    # Convert internal dataclass to Pydantic model
+    result = []
+    for c in candidates:
+        outcomes = []
+        for o in c.outcomes:
+            yes_price = o.get("yes_price")
+            if yes_price is None:
+                continue  # Skip outcomes without price
+            outcomes.append(OutcomeModel(
+                question=o.get("question", ""),
+                yes_price=yes_price,
+                condition_id=o.get("condition_id", ""),
+                volume=o.get("volume"),
+                liquidity=o.get("liquidity"),
+                end_date=o.get("end_date"),
+            ))
+        
+        if not outcomes:
+            continue  # Skip markets with no valid outcomes
+        
+        result.append(CandidateMarketModel(
+            event_id=c.event_id,
+            title=c.title,
+            slug=c.slug,
+            end_date=c.end_date,
+            volume=c.volume,
+            liquidity=c.liquidity,
+            outcomes=outcomes,
+            tags=c.tags,
+            filter_scores={
+                "complexity_score": c.complexity_score,
+                "edge_potential": c.edge_potential,
+            }
+        ))
+    
+    return result
+
+
+def get_filtered_conditions(
+    markets: list[CandidateMarketModel] = None,
+    verbose: bool = False
+) -> list[FilteredCondition]:
+    """
+    Get filtered conditions ready for query generation.
+    
+    If markets is None, fetches fresh from API.
+    Returns list of FilteredCondition models - one per outcome.
+    """
+    if markets is None:
+        markets = scan_markets(verbose=verbose)
+    
+    # Apply additional filters and flatten to conditions
+    conditions = []
+    placeholder_count = 0
+    low_volume_count = 0
+    out_of_zone_count = 0
+    time_filter_count = 0
+    
+    min_hours = FILTERED_MIN_DAYS_UNTIL_END * 24
+    max_hours = FILTERED_MAX_DAYS_UNTIL_END * 24
+    
+    for market in markets:
+        # Time filter
+        if market.end_date:
+            end_dt = parse_date(market.end_date)
+            if end_dt:
+                hours_until_end = (end_dt - datetime.now(timezone.utc)).total_seconds() / 3600
+                if hours_until_end < min_hours or hours_until_end > max_hours:
+                    time_filter_count += 1
+                    continue
+        
+        for outcome in market.outcomes:
+            # Skip outcomes without price
+            if outcome.yes_price is None:
+                continue
+            
+            # Price filter
+            if outcome.yes_price < FILTERED_MIN_OUTCOME_PRICE or outcome.yes_price > FILTERED_MAX_OUTCOME_PRICE:
+                out_of_zone_count += 1
+                continue
+            
+            # Placeholder filter
+            outcome_dict = {
+                "question": outcome.question,
+                "yes_price": outcome.yes_price,
+            }
+            if is_placeholder_outcome(outcome_dict):
+                placeholder_count += 1
+                continue
+            
+            # Volume filter
+            effective_volume = outcome.volume if outcome.volume is not None else (market.volume or 0)
+            if effective_volume < MIN_CONDITION_VOLUME:
+                low_volume_count += 1
+                continue
+            
+            # Create FilteredCondition
+            conditions.append(FilteredCondition(
+                condition_id=outcome.condition_id,
+                event_id=market.event_id,
+                event_title=market.title,
+                outcome_question=outcome.question,
+                yes_price=outcome.yes_price,
+                volume=effective_volume,
+                liquidity=outcome.liquidity,
+                end_date=outcome.end_date or market.end_date,
+            ))
+    
+    if verbose:
+        print(f"   ⏭️  Filtered out {time_filter_count} markets (time range)")
+        print(f"   ⏭️  Filtered out {out_of_zone_count} outcomes (price zone)")
+        print(f"   ⏭️  Filtered out {placeholder_count} placeholder outcomes")
+        print(f"   ⏭️  Filtered out {low_volume_count} low-volume outcomes")
+        print(f"   ✅  {len(conditions)} conditions passed all filters")
+    
+    return conditions
+
+
+# =============================================================================
+# MAIN (CLI entry point)
 # =============================================================================
 
 def main():
     parser = argparse.ArgumentParser(description="Fetch and filter Polymarket markets")
     parser.add_argument("--verbose", "-v", action="store_true", help="Show detailed filter decisions")
+    parser.add_argument("--no-save", action="store_true", help="Don't save to JSON files")
     args = parser.parse_args()
     
     print("=" * 70)
     print("POLYMARKET MARKET FETCHER & SCANNER")
     print("=" * 70)
     
-    # Fetch all events from API
-    events = fetch_all_events()
-    
-    # Filter events
-    candidates = filter_events(events, verbose=args.verbose)
+    # Use the public API functions
+    markets = scan_markets(verbose=args.verbose)
     
     # Print summary
-    high = [c for c in candidates if c.edge_potential == "high"]
-    medium = [c for c in candidates if c.edge_potential == "medium"]
+    high = [m for m in markets if m.filter_scores and m.filter_scores.get("edge_potential") == "high"]
+    medium = [m for m in markets if m.filter_scores and m.filter_scores.get("edge_potential") == "medium"]
     
     print(f"\n📊 RESULTS:")
     print(f"  High potential: {len(high)}")
     print(f"  Medium potential: {len(medium)}")
-    print(f"  Low potential: {len(candidates) - len(high) - len(medium)}")
+    print(f"  Low potential: {len(markets) - len(high) - len(medium)}")
     
     if high:
         print(f"\n🔥 TOP HIGH-POTENTIAL MARKETS:")
         for i, c in enumerate(high[:5], 1):
-            days = c.hours_until_end / 24 if c.hours_until_end else 0
             print(f"  {i}. {c.title[:60]}...")
-            print(f"     ${c.liquidity:,.0f} liquidity | {days:.0f} days | {c.outcome_count} outcomes")
+            print(f"     ${c.liquidity or 0:,.0f} liquidity | {c.end_date or 'N/A'} | {len(c.outcomes)} outcomes")
+    
+    # Get filtered conditions
+    print(f"\n🔍 Filtering to conditions...")
+    conditions = get_filtered_conditions(markets, verbose=args.verbose)
+    
+    print(f"\n✅ Found {len(conditions)} tradeable conditions")
+    
+    if args.no_save:
+        print("   (--no-save: not writing to files)")
+        return markets, conditions
     
     # Save outputs
     script_dir = Path(__file__).parent
     data_dir = script_dir.parent / "data"
     data_dir.mkdir(exist_ok=True)
     
-    # Save all candidates
+    # Save all candidates (as Pydantic model dicts)
     output_path = data_dir / "candidate_markets.json"
     with open(output_path, "w") as f:
-        json.dump([c.to_dict() for c in candidates], f, indent=2)
-    print(f"\n✅ Saved {len(candidates)} candidates to {output_path}")
+        json.dump([m.model_dump() for m in markets], f, indent=2)
+    print(f"\n✅ Saved {len(markets)} candidate markets to {output_path}")
     
-    # Save filtered candidates
-    filtered = create_filtered_output(candidates)
+    # Save filtered conditions (what goes into query generation)
     filtered_path = data_dir / "candidate_markets_filtered.json"
     with open(filtered_path, "w") as f:
-        json.dump(filtered, f, indent=2)
-    print(f"✅ Saved {len(filtered)} filtered candidates to {filtered_path}")
+        json.dump([c.model_dump() for c in conditions], f, indent=2)
+    print(f"✅ Saved {len(conditions)} filtered conditions to {filtered_path}")
     print(f"   (filtered to {FILTERED_MIN_DAYS_UNTIL_END}-{FILTERED_MAX_DAYS_UNTIL_END} days, {FILTERED_MIN_OUTCOME_PRICE:.0%}-{FILTERED_MAX_OUTCOME_PRICE:.0%} prices)")
+    
+    return markets, conditions
 
 
 if __name__ == "__main__":

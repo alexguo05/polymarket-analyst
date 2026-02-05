@@ -1,0 +1,80 @@
+# Cloud Build configuration for Polymarket Analyst
+# Builds and deploys to Cloud Run
+
+steps:
+  # Step 1: Build the Docker image
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '-t'
+      - 'gcr.io/$PROJECT_ID/polymarket-analyst:$COMMIT_SHA'
+      - '-t'
+      - 'gcr.io/$PROJECT_ID/polymarket-analyst:latest'
+      - '-f'
+      - 'infrastructure/Dockerfile'
+      - '.'
+    id: 'build'
+
+  # Step 2: Push to Container Registry
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'push'
+      - 'gcr.io/$PROJECT_ID/polymarket-analyst:$COMMIT_SHA'
+    id: 'push-sha'
+    waitFor: ['build']
+
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'push'
+      - 'gcr.io/$PROJECT_ID/polymarket-analyst:latest'
+    id: 'push-latest'
+    waitFor: ['build']
+
+  # Step 3: Deploy to Cloud Run
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: gcloud
+    args:
+      - 'run'
+      - 'deploy'
+      - 'polymarket-analyst'
+      - '--image'
+      - 'gcr.io/$PROJECT_ID/polymarket-analyst:$COMMIT_SHA'
+      - '--region'
+      - '${_REGION}'
+      - '--platform'
+      - 'managed'
+      - '--allow-unauthenticated'
+      - '--memory'
+      - '2Gi'
+      - '--cpu'
+      - '2'
+      - '--timeout'
+      - '3600'
+      - '--min-instances'
+      - '0'
+      - '--max-instances'
+      - '3'
+      - '--set-env-vars'
+      - 'ENVIRONMENT=production,GCP_PROJECT_ID=$PROJECT_ID'
+      - '--set-secrets'
+      - 'OPENAI_KEY=openai-api-key:latest,PERPLEXITY_KEY=perplexity-api-key:latest,DATABASE_URL=database-url:latest'
+    id: 'deploy'
+    waitFor: ['push-sha']
+
+# Substitution variables (can be overridden)
+substitutions:
+  _REGION: 'us-central1'
+
+# Build options
+options:
+  logging: CLOUD_LOGGING_ONLY
+  machineType: 'E2_HIGHCPU_8'
+
+# Store images in Container Registry
+images:
+  - 'gcr.io/$PROJECT_ID/polymarket-analyst:$COMMIT_SHA'
+  - 'gcr.io/$PROJECT_ID/polymarket-analyst:latest'
+
+# Timeout for entire build
+timeout: '1800s'
+

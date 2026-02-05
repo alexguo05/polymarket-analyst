@@ -1,0 +1,3 @@
+python src/get_markets.py
+python src/generate_queries.py --limit 5 --random --seed 42 --replace-output    
+python src/execute_searches.py --regenerate

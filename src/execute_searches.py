@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """
 Execute search queries using Perplexity's Sonar API.
-Returns structured, evidence-based results with scored citations.
 
-Reads from data/market_queries.json (condition-based structure)
-Outputs to data/search_results.json
+Functions for pipeline:
+    execute_searches(queries: list[ConditionQueries]) -> list[ConditionSearchResults]
+
+CLI Usage:
+    python execute_searches.py              # Execute searches for all queries
+    python execute_searches.py --limit 10   # Limit to 10 conditions
 """
 
 import json
@@ -19,16 +22,24 @@ from typing import Optional
 import requests
 from dotenv import load_dotenv
 
+# Add parent to path for imports
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from models.query import ConditionQueries
+from models.evidence import QueryResult, ConditionSearchResults
+from src.cost_tracker import UsageStats
+from config.settings import settings
+
 # Load environment variables
 env_path = Path(__file__).parent.parent / ".env"
 load_dotenv(env_path)
 
 # =============================================================================
-# CONFIGURATION
+# CONFIGURATION (from settings.py)
 # =============================================================================
 
-PERPLEXITY_MODEL = "sonar"  # Options: "sonar", "sonar-pro"
-RATE_LIMIT_DELAY = 0.5  # seconds between API calls
+PERPLEXITY_MODEL = settings.search_model
+RATE_LIMIT_DELAY = settings.search_rate_limit_delay
 TARGET_CITATIONS_PER_QUERY = 5
 
 # =============================================================================
@@ -91,26 +102,17 @@ End with:
 Synthesize all findings. What is the weight of evidence? What key questions remain unanswered?"""
 
 
-def save_results(output_path: Path, results: list[dict]):
-    """Save results to JSON file."""
-    output_path.parent.mkdir(exist_ok=True)
-    with open(output_path, "w") as f:
-        json.dump(results, f, indent=2)
+# =============================================================================
+# INTERNAL FUNCTIONS
+# =============================================================================
 
-
-def search_perplexity(api_key: str, query: str, condition_context: str, recency: str = "week") -> Optional[dict]:
-    """
-    Execute a search query using Perplexity's Sonar API.
-    
-    Args:
-        api_key: Perplexity API key
-        query: The search query
-        condition_context: Context about the specific condition being evaluated
-        recency: "day", "week", "month", or "year"
-    
-    Returns:
-        Parsed JSON response or None on error
-    """
+def _search_perplexity(
+    api_key: str, 
+    query: str, 
+    condition_context: str, 
+    recency: str = "week"
+) -> Optional[dict]:
+    """Execute a search query using Perplexity's Sonar API."""
     url = "https://api.perplexity.ai/chat/completions"
     
     headers = {
@@ -145,12 +147,12 @@ Search for relevant information and analyze each source you find using the speci
         message = data.get("choices", [{}])[0].get("message", {})
         content = message.get("content", "")
         
-        # Get citations - check multiple possible locations in API response
+        # Get citations from various locations in API response
         api_citations = (
-            data.get("citations", []) or                    # Top-level citations
-            message.get("citations", []) or                 # Inside message object
-            data.get("sources", []) or                      # Alternative field name
-            message.get("context", {}).get("citations", []) # Nested in context
+            data.get("citations", []) or
+            message.get("citations", []) or
+            data.get("sources", []) or
+            message.get("context", {}).get("citations", [])
         )
         
         return {
@@ -158,7 +160,6 @@ Search for relevant information and analyze each source you find using the speci
             "citations": api_citations,
             "model": data.get("model", PERPLEXITY_MODEL),
             "usage": data.get("usage", {}),
-            "raw_keys": list(data.keys())  # Debug: show what keys are in response
         }
         
     except requests.exceptions.Timeout:
@@ -166,15 +167,161 @@ Search for relevant information and analyze each source you find using the speci
         return None
     except requests.exceptions.HTTPError as e:
         print(f"    ❌ HTTP error: {e}")
-        if e.response:
-            print(f"    Response: {e.response.text[:500]}")
         return None
     except Exception as e:
         print(f"    ❌ Error: {e}")
         return None
 
 
+# =============================================================================
+# PUBLIC API (for pipeline use)
+# =============================================================================
+
+def execute_searches(
+    condition_queries: list[ConditionQueries],
+    api_key: str = None,
+    recency: str = "week",
+    query_limit: int = None,
+    verbose: bool = True,
+) -> tuple[list[ConditionSearchResults], UsageStats]:
+    """
+    Execute search queries for a list of conditions.
+    
+    This is the main entry point for the pipeline.
+    
+    Args:
+        condition_queries: List of ConditionQueries to execute
+        api_key: Optional Perplexity API key (uses env if not provided)
+        recency: Recency filter ("day", "week", "month", "year")
+        query_limit: Optional limit on queries per condition
+        verbose: Print progress
+        
+    Returns:
+        Tuple of (List of ConditionSearchResults, UsageStats with cost info)
+    """
+    if api_key is None:
+        api_key = os.getenv("PERPLEXITY_KEY")
+        if not api_key:
+            raise ValueError("PERPLEXITY_KEY not found in environment")
+    
+    results = []
+    usage_stats = UsageStats()
+    stats = {"success": 0, "failed": 0}
+    
+    for i, cond in enumerate(condition_queries):
+        if verbose:
+            q_short = cond.outcome_question[:45] + "..." if len(cond.outcome_question) > 45 else cond.outcome_question
+            print(f"[{i+1}/{len(condition_queries)}] {q_short} ({cond.yes_price:.1%})")
+        
+        # Build condition context
+        condition_context = f"""Event: {cond.event_title}
+Condition: {cond.outcome_question}
+Current Market Price: {cond.yes_price:.1%} (implied probability)"""
+        
+        # Execute queries
+        queries = cond.queries
+        if query_limit:
+            queries = queries[:query_limit]
+        
+        query_results = []
+        condition_requests = 0
+        condition_tokens = 0
+        condition_cost = 0.0
+        
+        for j, query in enumerate(queries):
+            if verbose:
+                print(f"  [{j+1}/{len(queries)}] {query.category}: {query.query[:55]}...")
+            
+            result = _search_perplexity(api_key, query.query, condition_context, recency)
+            
+            if result:
+                stats['success'] += 1
+                citations = result.get('citations', [])
+                
+                # Track usage/cost - Perplexity charges per request (~$0.005)
+                usage = result.get('usage', {})
+                req_cost = 0.005  # $5/1000 requests
+                req_tokens = usage.get('total_tokens', 0)
+                
+                condition_requests += 1
+                condition_tokens += req_tokens
+                condition_cost += req_cost
+                
+                # Also update aggregate stats
+                usage_stats.requests += 1
+                usage_stats.total_tokens += req_tokens
+                usage_stats.estimated_cost += req_cost
+                
+                query_results.append(QueryResult(
+                    query_id=query.query_id,
+                    query=query.query,
+                    category=query.category,
+                    response=result.get('response', ''),
+                    citations=citations,
+                    searched_at=datetime.now(timezone.utc).isoformat(),
+                ))
+                
+                if verbose:
+                    print(f"    ✅ Got response ({len(result.get('response', ''))} chars, {len(citations)} citations) [${req_cost:.4f}]")
+            else:
+                stats['failed'] += 1
+                # Still create a result with empty response
+                query_results.append(QueryResult(
+                    query_id=query.query_id,
+                    query=query.query,
+                    category=query.category,
+                    response="",
+                    citations=[],
+                    searched_at=datetime.now(timezone.utc).isoformat(),
+                ))
+                if verbose:
+                    print(f"    ❌ Failed")
+            
+            # Rate limiting
+            if j < len(queries) - 1:
+                time.sleep(RATE_LIMIT_DELAY)
+        
+        # Create search results for this condition with cost tracking
+        results.append(ConditionSearchResults(
+            condition_id=cond.condition_id,
+            event_id=cond.event_id,
+            event_title=cond.event_title,
+            outcome_question=cond.outcome_question,
+            yes_price=cond.yes_price,
+            volume=cond.volume,
+            liquidity=cond.liquidity,
+            end_date=cond.end_date,
+            query_results=query_results,
+            searched_at=datetime.now(timezone.utc).isoformat(),
+            # Cost tracking for this condition
+            total_requests=condition_requests,
+            total_tokens=condition_tokens,
+            cost_usd=condition_cost,
+        ))
+        
+        if verbose:
+            print(f"  💰 Condition cost: ${condition_cost:.4f} ({condition_requests} requests)\n")
+    
+    if verbose:
+        print(f"📊 Queries: {stats['success']} succeeded, {stats['failed']} failed")
+        print(f"   💰 {usage_stats.summary()}")
+    
+    return results, usage_stats
+
+
+def _save_results(output_path: Path, results: list[dict]):
+    """Save results to JSON file."""
+    output_path.parent.mkdir(exist_ok=True)
+    with open(output_path, "w") as f:
+        json.dump(results, f, indent=2)
+
+
+# =============================================================================
+# MAIN (CLI entry point)
+# =============================================================================
+
 def main():
+    """CLI entry point."""
     parser = argparse.ArgumentParser(description="Execute searches using Perplexity API")
     parser.add_argument("--input", type=str, default="data/market_queries.json",
                         help="Input file with condition queries")
@@ -190,9 +337,9 @@ def main():
     parser.add_argument("--dry-run", action="store_true",
                         help="Print what would be searched without calling API")
     parser.add_argument("--regenerate", action="store_true",
-                        help="Regenerate searches for all queries, replacing existing results")
-    parser.add_argument("--rerun-empty", action="store_true",
-                        help="Re-run queries that returned no citations")
+                        help="Regenerate all search results")
+    parser.add_argument("--no-save", action="store_true",
+                        help="Don't save to JSON files")
     args = parser.parse_args()
     
     script_dir = Path(__file__).parent
@@ -200,227 +347,102 @@ def main():
     input_path = project_dir / args.input
     output_path = project_dir / args.output
     
-    # Load condition queries (new structure: one entry per condition)
+    # Load condition queries from JSON
     print(f"📂 Loading queries from {input_path}")
     with open(input_path) as f:
-        condition_queries = json.load(f)
+        raw_queries = json.load(f)
     
-    total_conditions = len(condition_queries)
-    if args.limit:
-        condition_queries = condition_queries[:args.limit]
+    # Convert to ConditionQueries models
+    from models.query import SearchQuery as SearchQueryModel
+    condition_queries = []
+    for q in raw_queries:
+        # Convert query dicts to SearchQuery models
+        queries = [SearchQueryModel(**sq) for sq in q.get('queries', [])]
+        condition_queries.append(ConditionQueries(
+            condition_id=q['condition_id'],
+            event_id=q['event_id'],
+            event_title=q['event_title'],
+            outcome_question=q['outcome_question'],
+            yes_price=q['yes_price'],
+            volume=q.get('condition_volume'),
+            liquidity=q.get('condition_liquidity'),
+            end_date=q.get('end_date'),
+            queries=queries,
+            generated_at=q.get('generated_at', ''),
+            model=q.get('model', 'unknown'),
+        ))
     
-    # Load existing results to skip already-executed queries
+    print(f"📊 Found {len(condition_queries)} conditions")
+    
+    # Load existing results to skip already-processed
+    existing_condition_ids = set()
     existing_results = []
-    existing_query_ids = set()
-    empty_citation_ids = set()
     if output_path.exists() and not args.regenerate:
-        print(f"📂 Loading existing results from {output_path}")
         with open(output_path) as f:
             existing_results = json.load(f)
-        # Extract all query_ids from existing results (now per condition)
-        for condition_result in existing_results:
-            for qr in condition_result.get('query_results', []):
-                if 'query_id' in qr:
-                    query_id = qr['query_id']
-                    citations = qr.get('citations', [])
-                    if not citations or len(citations) == 0:
-                        empty_citation_ids.add(query_id)
-                    existing_query_ids.add(query_id)
-        print(f"   Found {len(existing_query_ids)} existing query results")
-        if empty_citation_ids:
-            print(f"   Found {len(empty_citation_ids)} queries with no citations")
-    elif args.regenerate:
-        print("🔄 Regenerate mode: will replace all existing results")
+        existing_condition_ids = {r['condition_id'] for r in existing_results}
+        print(f"   Found {len(existing_condition_ids)} existing results")
     
-    # If --rerun-empty, remove empty citation queries from existing_query_ids so they get rerun
-    if args.rerun_empty and empty_citation_ids:
-        print(f"🔄 Rerun-empty mode: will re-execute {len(empty_citation_ids)} queries with no citations")
-        existing_query_ids -= empty_citation_ids
+    # Filter out already-processed conditions
+    conditions_to_process = [c for c in condition_queries if c.condition_id not in existing_condition_ids]
+    skipped = len(condition_queries) - len(conditions_to_process)
     
-    # Count queries to process (excluding already-done ones)
-    total_queries = 0
-    skipped_queries = 0
-    for cond in condition_queries:
-        queries = cond.get('queries', [])
-        if args.query_limit:
-            queries = queries[:args.query_limit]
-        for q in queries:
-            query_id = q.get('query_id')
-            if query_id and query_id in existing_query_ids:
-                skipped_queries += 1
-            else:
-                total_queries += 1
+    if args.limit:
+        conditions_to_process = conditions_to_process[:args.limit]
     
-    print(f"📊 Processing {len(condition_queries)} conditions ({total_queries} queries to execute, {skipped_queries} skipped)")
-    print(f"🔍 Recency filter: {args.recency}")
-    print(f"🎯 Target citations per query: {TARGET_CITATIONS_PER_QUERY}")
+    print(f"📊 Processing {len(conditions_to_process)} conditions ({skipped} skipped)")
     
     if args.dry_run:
-        print(f"\n{'='*60}")
-        print("DRY RUN - Queries that would be executed:\n")
-        for cond in condition_queries:
-            queries = cond.get('queries', [])
-            if args.query_limit:
-                queries = queries[:args.query_limit]
-            # Filter to only show queries that would actually run
-            queries_to_run = [q for q in queries if q.get('query_id') not in existing_query_ids]
-            if queries_to_run:
-                q_short = cond['outcome_question'][:55] + "..." if len(cond['outcome_question']) > 55 else cond['outcome_question']
-                print(f"📌 {q_short} ({cond['yes_price']:.1%})")
-                for q in queries_to_run:
-                    print(f"   [{q.get('category', '?')}] {q['query'][:70]}...")
-                print()
-        if skipped_queries > 0:
-            print(f"⏭️  Would skip {skipped_queries} queries with existing results")
-        return
+        print("\n🔍 DRY RUN - Conditions that would be searched:")
+        for c in conditions_to_process:
+            q_short = c.outcome_question[:55] + "..." if len(c.outcome_question) > 55 else c.outcome_question
+            print(f"  📌 {q_short} ({c.yes_price:.1%})")
+            for q in c.queries:
+                print(f"     [{q.category}] {q.query[:60]}...")
+        return None
     
-    # Check if there's anything to process
-    if total_queries == 0:
-        print("\n✅ All queries already have results. Nothing to do.")
-        print(f"   Use --regenerate to force re-execution of all queries.")
-        return
+    if not conditions_to_process:
+        print("\n✅ All conditions already have results. Use --regenerate to force.")
+        return []
     
-    # Check for API key
-    api_key = os.getenv("PERPLEXITY_KEY")
-    if not api_key:
-        print("❌ PERPLEXITY_KEY not found in .env file")
-        print("   Add: PERPLEXITY_KEY=\"your-key-here\"")
-        sys.exit(1)
+    # Execute searches
+    print(f"\n🚀 Executing searches using {PERPLEXITY_MODEL}...\n")
+    new_results, stats = execute_searches(
+        conditions_to_process,
+        recency=args.recency,
+        query_limit=args.query_limit,
+        verbose=True,
+    )
     
-    print(f"🔑 API key loaded ({len(api_key)} chars)")
-    print(f"🤖 Model: {PERPLEXITY_MODEL}")
+    if args.no_save:
+        print(f"\n✅ Executed searches for {len(new_results)} conditions (not saved)")
+        return new_results, stats
+    
+    # Convert to dicts for JSON
+    new_results_dicts = []
+    for r in new_results:
+        d = r.model_dump()
+        # Convert QueryResult models to dicts
+        d['query_results'] = [qr.model_dump() for qr in r.query_results]
+        new_results_dicts.append(d)
+    
+    # Merge with existing
+    if existing_results and not args.regenerate:
+        existing_by_id = {r['condition_id']: r for r in existing_results}
+        for r in new_results_dicts:
+            existing_by_id[r['condition_id']] = r
+        final_results = list(existing_by_id.values())
+    else:
+        final_results = new_results_dicts
+    
+    # Save
+    _save_results(output_path, final_results)
+    
     print(f"\n{'='*60}")
-    print(f"🚀 Starting searches...\n")
+    print(f"✅ Executed searches for {len(new_results)} conditions")
+    print(f"✅ Total {len(final_results)} saved to {output_path}")
     
-    # Build a map of existing results by condition_id for merging
-    existing_by_condition = {r['condition_id']: r for r in existing_results}
-    
-    # Initialize results with existing data (will be updated incrementally)
-    results_by_condition = dict(existing_by_condition) if not args.regenerate else {}
-    stats = {"success": 0, "failed": 0, "skipped": 0}
-    
-    for i, cond in enumerate(condition_queries):
-        condition_id = cond['condition_id']
-        outcome_question = cond['outcome_question']
-        yes_price = cond['yes_price']
-        
-        q_short = outcome_question[:45] + "..." if len(outcome_question) > 45 else outcome_question
-        
-        # Build condition context for the search
-        condition_context = f"""Event: {cond['event_title']}
-Condition: {outcome_question}
-Current Market Price: {yes_price:.1%} (implied probability)"""
-        
-        # Get or create condition result structure
-        if condition_id in results_by_condition:
-            condition_result = results_by_condition[condition_id]
-            if 'query_results' not in condition_result:
-                condition_result['query_results'] = []
-        else:
-            condition_result = {
-                "condition_id": condition_id,
-                "event_id": cond['event_id'],
-                "event_title": cond['event_title'],
-                "outcome_question": outcome_question,
-                "yes_price": yes_price,
-                "end_date": cond.get('end_date'),
-                "condition_volume": cond.get('condition_volume'),
-                "condition_liquidity": cond.get('condition_liquidity'),
-                "searched_at": datetime.now(timezone.utc).isoformat(),
-                "recency_filter": args.recency,
-                "model": PERPLEXITY_MODEL,
-                "query_results": []
-            }
-            results_by_condition[condition_id] = condition_result
-        
-        # Build index of existing query positions for in-place replacement
-        query_index = {qr.get('query_id'): idx for idx, qr in enumerate(condition_result['query_results'])}
-        
-        queries = cond.get('queries', [])
-        if args.query_limit:
-            queries = queries[:args.query_limit]
-        
-        # Filter to queries that need to be executed
-        queries_to_run = []
-        for q in queries:
-            query_id = q.get('query_id')
-            if query_id and query_id in existing_query_ids:
-                stats['skipped'] += 1
-            else:
-                queries_to_run.append(q)
-        
-        if not queries_to_run:
-            continue
-        
-        print(f"[{i+1}/{len(condition_queries)}] {q_short} ({yes_price:.1%}) - {len(queries_to_run)} queries")
-        
-        for j, query_obj in enumerate(queries_to_run):
-            query = query_obj['query']
-            query_id = query_obj.get('query_id', f"{condition_id[-16:]}_q{j}")
-            category = query_obj.get('category', 'unknown')
-            
-            print(f"  [{j+1}/{len(queries_to_run)}] {category}: {query[:55]}...")
-            
-            result = search_perplexity(api_key, query, condition_context, args.recency)
-            
-            if result:
-                stats['success'] += 1
-                citations = result.get('citations', [])
-                citation_count = len(citations)
-                
-                # Debug: show API response structure if no citations found
-                if citation_count == 0:
-                    print(f"    ⚠️  No citations found. API response keys: {result.get('raw_keys', [])}")
-                
-                new_result = {
-                    "query_id": query_id,
-                    "query": query,
-                    "category": category,
-                    "priority": query_obj.get('priority', 'medium'),
-                    "response": result.get('response', ''),
-                    "citations": citations
-                }
-                
-                # Replace in-place if exists, otherwise append
-                if query_id in query_index:
-                    condition_result['query_results'][query_index[query_id]] = new_result
-                else:
-                    condition_result['query_results'].append(new_result)
-                    query_index[query_id] = len(condition_result['query_results']) - 1
-                
-                print(f"    ✅ Got response ({len(result.get('response', ''))} chars, {citation_count} citations)")
-            else:
-                stats['failed'] += 1
-                new_result = {
-                    "query_id": query_id,
-                    "query": query,
-                    "category": category,
-                    "priority": query_obj.get('priority', 'medium'),
-                    "evidence": [],
-                    "search_quality": {"error": "Search failed"}
-                }
-                
-                # Replace in-place if exists, otherwise append
-                if query_id in query_index:
-                    condition_result['query_results'][query_index[query_id]] = new_result
-                else:
-                    condition_result['query_results'].append(new_result)
-                    query_index[query_id] = len(condition_result['query_results']) - 1
-                
-                print(f"    ❌ Failed")
-            
-            # Update timestamp and save after each query
-            condition_result['searched_at'] = datetime.now(timezone.utc).isoformat()
-            save_results(output_path, list(results_by_condition.values()))
-            
-            # Rate limiting
-            time.sleep(RATE_LIMIT_DELAY)
-        
-        print()
-    
-    print(f"{'='*60}")
-    print(f"✅ Saved {len(results_by_condition)} condition results to {output_path}")
-    print(f"📊 Queries: {stats['success']} succeeded, {stats['failed']} failed, {stats['skipped']} skipped")
+    return new_results
 
 
 if __name__ == "__main__":
