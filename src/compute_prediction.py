@@ -23,14 +23,16 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from models.evidence import ConditionAnalysis, EvidenceScore
 from models.prediction import Prediction, EvidenceBreakdown, PipelineOutput
+from config.settings import settings
 
 # =============================================================================
-# CONFIGURATION
+# CONFIGURATION (can be overridden by settings)
 # =============================================================================
 
-EVIDENCE_SCALE = 0.5
-MIN_PROB = 0.01
-MAX_PROB = 0.99
+EVIDENCE_SCALE = settings.evidence_scale
+MIN_PROB = settings.min_prob
+MAX_PROB = settings.max_prob
+MIN_EDGE_THRESHOLD = settings.min_edge_threshold
 
 
 # =============================================================================
@@ -141,10 +143,10 @@ def _compute_single_prediction(
     days_until_end = calculate_days_until_end(analysis.end_date)
     apy = calculate_apy(edge, days_until_end, market_price) if days_until_end else None
     
-    # Determine direction
-    if edge > 0.02:
+    # Determine direction based on edge threshold from settings
+    if edge > MIN_EDGE_THRESHOLD:
         direction = "YES"
-    elif edge < -0.02:
+    elif edge < -MIN_EDGE_THRESHOLD:
         direction = "NO"
     else:
         direction = "HOLD"
@@ -306,8 +308,8 @@ def main():
             event_title=d['event_title'],
             outcome_question=d['outcome_question'],
             market_price=d['market_price'],
-            volume=d.get('condition_volume'),
-            liquidity=d.get('condition_liquidity'),
+            volume=d.get('volume'),  # Fix: was 'condition_volume'
+            liquidity=d.get('liquidity'),  # Fix: was 'condition_liquidity'
             end_date=d.get('end_date'),
             predictability=d.get('predictability', 0.5),
             predictability_reason=d.get('predictability_reason', ''),

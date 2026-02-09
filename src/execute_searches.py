@@ -238,9 +238,10 @@ Current Market Price: {cond.yes_price:.1%} (implied probability)"""
                 stats['success'] += 1
                 citations = result.get('citations', [])
                 
-                # Track usage/cost - Perplexity charges per request (~$0.005)
+                # Track usage/cost - Perplexity charges per request
                 usage = result.get('usage', {})
-                req_cost = 0.005  # $5/1000 requests
+                pricing = settings.model_config_map.get(PERPLEXITY_MODEL, {}).get("pricing", {"per_request": 0.005})
+                req_cost = pricing.get("per_request", 0.005)
                 req_tokens = usage.get('total_tokens', 0)
                 
                 condition_requests += 1

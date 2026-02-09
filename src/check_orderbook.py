@@ -370,10 +370,11 @@ def main():
     
     script_dir = Path(__file__).parent
     project_dir = script_dir.parent
-    events_file = project_dir.parent / "polymarket_events.json"
+    events_file = project_dir / "data" / "candidate_markets.json"
     
     if not events_file.exists():
         print(f"Events file not found: {events_file}")
+        print(f"Run 'python src/get_markets.py' first to generate market data.")
         sys.exit(1)
     
     market = load_market(events_file, args.identifier)

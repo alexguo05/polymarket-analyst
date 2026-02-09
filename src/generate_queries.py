@@ -127,8 +127,9 @@ Generate research questions to help evaluate the probability of: {condition.outc
         if hasattr(response, 'usage') and response.usage:
             input_tok = response.usage.prompt_tokens or 0
             output_tok = response.usage.completion_tokens or 0
-            # GPT-5-mini pricing: $0.15/1M input, $0.60/1M output
-            cost = (input_tok * 0.15 + output_tok * 0.60) / 1_000_000
+            # Get pricing from settings
+            pricing = settings.model_config_map.get(MODEL, {}).get("pricing", {"input": 0.15, "output": 0.60})
+            cost = (input_tok * pricing["input"] + output_tok * pricing["output"]) / 1_000_000
             usage_info = {
                 "input_tokens": input_tok,
                 "output_tokens": output_tok,

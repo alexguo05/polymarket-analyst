@@ -435,6 +435,7 @@ def analyze_evidence(
         usage_stats.input_tokens += usage_info["input_tokens"]
         usage_stats.output_tokens += usage_info["output_tokens"]
         reasoning_tok = usage_info.get("reasoning_tokens", 0)
+        usage_stats.reasoning_tokens += reasoning_tok  # Fix: was missing this line!
         usage_stats.total_tokens += usage_info["input_tokens"] + usage_info["output_tokens"] + reasoning_tok
         usage_stats.estimated_cost += usage_info["cost_usd"]
         usage_stats.requests += 1

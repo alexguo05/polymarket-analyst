@@ -14,6 +14,8 @@ class Outcome(BaseModel):
     question: str
     yes_price: Optional[float] = None  # Can be None for some outcomes
     condition_id: str
+    yes_token_id: Optional[str] = None  # Token ID for YES shares (for trading)
+    no_token_id: Optional[str] = None   # Token ID for NO shares (for trading)
     volume: Optional[float] = None
     liquidity: Optional[float] = None
     end_date: Optional[str] = None
@@ -54,6 +56,10 @@ class FilteredCondition(BaseModel):
     event_title: str
     outcome_question: str
     
+    # Token IDs (for trading)
+    yes_token_id: Optional[str] = None
+    no_token_id: Optional[str] = None
+    
     # Market data
     yes_price: float
     volume: Optional[float] = None
@@ -72,6 +78,8 @@ class FilteredCondition(BaseModel):
             event_id=market.event_id,
             event_title=market.title,
             outcome_question=outcome.question,
+            yes_token_id=outcome.yes_token_id,
+            no_token_id=outcome.no_token_id,
             yes_price=outcome.yes_price,
             volume=outcome.volume,
             liquidity=outcome.liquidity,

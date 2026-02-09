@@ -431,11 +431,14 @@ def filter_events(events: list[dict], verbose: bool = False) -> list[CandidateMa
         complexity = calculate_complexity_score(event)
         
         outcomes_simplified = [{
-                "question": o.get("question", "")[:100],
-                "yes_price": o.get("yes_price"),
-                "condition_id": o.get("condition_id"),
+            "question": o.get("question", "")[:100],
+            "yes_price": o.get("yes_price"),
+            "condition_id": o.get("condition_id"),
+            "yes_token_id": o.get("yes_token_id"),
+            "no_token_id": o.get("no_token_id"),
             "volume": o.get("volume"),
             "liquidity": o.get("liquidity"),
+            "end_date": o.get("end_date"),
         } for o in outcomes]
         
         candidate = CandidateMarket(
@@ -579,6 +582,8 @@ def scan_markets(verbose: bool = False) -> list[CandidateMarketModel]:
                 question=o.get("question", ""),
                 yes_price=yes_price,
                 condition_id=o.get("condition_id", ""),
+                yes_token_id=o.get("yes_token_id"),
+                no_token_id=o.get("no_token_id"),
                 volume=o.get("volume"),
                 liquidity=o.get("liquidity"),
                 end_date=o.get("end_date"),
@@ -662,13 +667,15 @@ def get_filtered_conditions(
             if effective_volume < MIN_CONDITION_VOLUME:
                 low_volume_count += 1
                 continue
-            
+        
             # Create FilteredCondition
             conditions.append(FilteredCondition(
                 condition_id=outcome.condition_id,
                 event_id=market.event_id,
                 event_title=market.title,
                 outcome_question=outcome.question,
+                yes_token_id=outcome.yes_token_id,
+                no_token_id=outcome.no_token_id,
                 yes_price=outcome.yes_price,
                 volume=effective_volume,
                 liquidity=outcome.liquidity,

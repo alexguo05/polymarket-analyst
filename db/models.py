@@ -77,6 +77,11 @@ class Event(Base):
     volume = Column(Float)
     liquidity = Column(Float)
     tags = Column(JSON)  # Store as JSON array
+    
+    # Filter scores from scanning
+    complexity_score = Column(Float)  # How complex/analyzable is this event
+    edge_potential = Column(String(20))  # "high", "medium", "low"
+    
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     
@@ -92,6 +97,8 @@ class Condition(Base):
     event_id = Column(Integer, ForeignKey("events.id"), nullable=False)
     condition_id = Column(String(255), unique=True, nullable=False, index=True)
     question = Column(Text, nullable=False)
+    yes_token_id = Column(String(255))  # Token ID for YES shares (for trading)
+    no_token_id = Column(String(255))   # Token ID for NO shares (for trading)
     yes_price = Column(Float)
     volume = Column(Float)
     liquidity = Column(Float)
@@ -122,13 +129,21 @@ class Prediction(Base):
     edge_percent = Column(Float)
     
     # Time value
-    days_until_end = Column(Integer)
+    days_until_end = Column(Float)  # Changed to Float for decimals
     apy = Column(Float)
     
     # Analysis
     predictability = Column(Float)
+    predictability_reason = Column(Text)  # LLM reasoning for predictability
     recommendation = Column(Enum(Recommendation))
-    reasoning = Column(Text)
+    
+    # Computed values
+    num_evidence = Column(Integer)  # Count of evidence items
+    total_raw_adjustment = Column(Float)  # Sum of all raw adjustments
+    scaled_adjustment = Column(Float)  # Final scaled shift applied
+    
+    # Model info
+    analysis_model = Column(String(100))  # e.g., "gpt-5.2"
     
     created_at = Column(DateTime, default=datetime.utcnow)
     
@@ -214,6 +229,61 @@ class Trade(Base):
     )
 
 
+class GeneratedQuery(Base):
+    """Generated search queries for a condition."""
+    __tablename__ = "generated_queries"
+    
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    condition_id = Column(Integer, ForeignKey("conditions.id"), nullable=False)
+    pipeline_run_id = Column(Integer, ForeignKey("pipeline_runs.id"))
+    
+    query_id = Column(String(255), nullable=False, index=True)
+    query_text = Column(Text, nullable=False)
+    purpose = Column(Text)  # Why this query was chosen
+    category = Column(String(50))  # "base_rate", "procedural", "recent_developments", etc.
+    priority = Column(String(20))  # "high", "medium", "low"
+    
+    # Generation metadata
+    model = Column(String(100))  # e.g., "gpt-5-mini"
+    
+    created_at = Column(DateTime, default=datetime.utcnow)
+    
+    # Relationships
+    condition = relationship("Condition")
+    pipeline_run = relationship("PipelineRun")
+
+
+class SearchResult(Base):
+    """Raw search query results from Perplexity."""
+    __tablename__ = "search_results"
+    
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    condition_id = Column(Integer, ForeignKey("conditions.id"), nullable=False)
+    pipeline_run_id = Column(Integer, ForeignKey("pipeline_runs.id"))
+    
+    query_id = Column(String(255), nullable=False, index=True)
+    query_text = Column(Text, nullable=False)
+    category = Column(String(50))  # "base_rate", "procedural", etc.
+    
+    # Response from Perplexity
+    response_text = Column(Text)  # The full answer text
+    citations = Column(JSON)  # List of citation URLs
+    
+    # Metadata
+    model = Column(String(100))  # e.g., "sonar", "sonar-pro"
+    searched_at = Column(DateTime)  # When search was executed
+    
+    created_at = Column(DateTime, default=datetime.utcnow)
+    
+    # Relationships
+    condition = relationship("Condition")
+    pipeline_run = relationship("PipelineRun")
+    
+    __table_args__ = (
+        Index("idx_search_results_query_id", "query_id"),
+    )
+
+
 class EvidenceScore(Base):
     """Evidence scoring from analysis."""
     __tablename__ = "evidence_scores"
@@ -225,15 +295,27 @@ class EvidenceScore(Base):
     query_text = Column(Text)
     key_finding = Column(Text)
     
-    # Quality scores
+    # Quality scores with reasoning
     reliability = Column(Float)
-    recency = Column(Float)
-    relevance = Column(Float)
-    specificity = Column(Float)
+    reliability_reason = Column(Text)
     
-    # Direction (derived strength in compute_prediction)
+    recency = Column(Float)
+    recency_reason = Column(Text)
+    
+    relevance = Column(Float)
+    relevance_reason = Column(Text)
+    
+    specificity = Column(Float)
+    specificity_reason = Column(Text)
+    
+    # Direction
     direction = Column(Integer)  # -1, 0, 1
     direction_reason = Column(Text)
+    
+    # Computed values (from compute_prediction)
+    quality_score = Column(Float)  # Combined quality metric
+    strength = Column(Float)  # Derived strength
+    raw_adjustment = Column(Float)  # Probability adjustment for this query
     
     created_at = Column(DateTime, default=datetime.utcnow)
     
@@ -259,6 +341,25 @@ class PipelineRun(Base):
     predictions_made = Column(Integer, default=0)
     trades_executed = Column(Integer, default=0)
     
+    # Parameters used
+    parameters = Column(JSON)  # {"evidence_scale": 0.5, "min_prob": 0.01, "max_prob": 0.99}
+    
+    # Cost tracking
+    query_gen_tokens = Column(Integer, default=0)
+    query_gen_cost = Column(Float, default=0.0)
+    search_requests = Column(Integer, default=0)
+    search_cost = Column(Float, default=0.0)
+    analysis_input_tokens = Column(Integer, default=0)
+    analysis_output_tokens = Column(Integer, default=0)
+    analysis_reasoning_tokens = Column(Integer, default=0)
+    analysis_cost = Column(Float, default=0.0)
+    total_cost = Column(Float, default=0.0)
+    
+    # Models used
+    query_model = Column(String(100))  # e.g., "gpt-5-mini"
+    search_model = Column(String(100))  # e.g., "sonar-pro"
+    analysis_model = Column(String(100))  # e.g., "gpt-5.2"
+    
     error_message = Column(Text)
     
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -268,6 +369,30 @@ class PipelineRun(Base):
     
     __table_args__ = (
         Index("idx_pipeline_runs_status", "status"),
+    )
+
+
+class PriceHistory(Base):
+    """Historical price snapshots for conditions."""
+    __tablename__ = "price_history"
+    
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    condition_id = Column(Integer, ForeignKey("conditions.id"), nullable=False)
+    
+    yes_price = Column(Float, nullable=False)
+    volume = Column(Float)
+    liquidity = Column(Float)
+    
+    # Source of this snapshot
+    source = Column(String(50))  # "pipeline", "monitor", "api"
+    
+    recorded_at = Column(DateTime, default=datetime.utcnow, index=True)
+    
+    # Relationships
+    condition = relationship("Condition")
+    
+    __table_args__ = (
+        Index("idx_price_history_condition_time", "condition_id", "recorded_at"),
     )
 
 
